@@ -130,22 +130,24 @@ func (ew *eventWorker) Display() error {
 	return e
 }
 
-func (ew *eventWorker) writeEvent(e event.IEventStruct) {
+func (ew *eventWorker) writeEvent(e event.IEventStruct, tsize int) bool {
 	if ew.status != ProcessStateInit {
 		_ = ew.writeToChan("write events failed, unknow eventWorker status")
-		return
+		return false
 	}
 	ew.payload.Write(e.Payload())
+	//terminal write when reach the truncate size
+	if tsize > 0 && ew.payload.Len() >= tsize {
+		ew.payload.Truncate(tsize)
+		_ = ew.writeToChan(fmt.Sprintf("Events truncated, size: %d bytes\n", tsize))
+		return true
+	}
+	return false
 }
 
 // 解析类型，输出
 func (ew *eventWorker) parserEvents() []byte {
 	ew.status = ProcessStateProcessing
-	tsize := int(ew.processor.truncateSize)
-	if tsize > 0 && ew.payload.Len() > tsize {
-		ew.payload.Truncate(tsize)
-		_ = ew.writeToChan(fmt.Sprintf("Events truncated, size: %d bytes\n", tsize))
-	}
 	parser := NewParser(ew.payload.Bytes())
 	ew.parser = parser
 	n, e := ew.parser.Write(ew.payload.Bytes())
@@ -157,6 +159,7 @@ func (ew *eventWorker) parserEvents() []byte {
 }
 
 func (ew *eventWorker) Run() {
+	tsize := int(ew.processor.truncateSize)
 	for {
 		select {
 		case <-ew.ticker.C:
@@ -189,7 +192,10 @@ func (ew *eventWorker) Run() {
 				for {
 					select {
 					case e := <-ew.incoming:
-						ew.writeEvent(e)
+						if ew.writeEvent(e, tsize) {
+							ew.Close()
+							return
+						}
 					default:
 						if ew.IfUsed() {
 							time.Sleep(10 * time.Millisecond)
@@ -204,7 +210,11 @@ func (ew *eventWorker) Run() {
 		case e := <-ew.incoming:
 			// reset tickerCount
 			ew.tickerCount = 0
-			ew.writeEvent(e)
+			if ew.writeEvent(e, tsize) {
+				ew.processor.delWorkerByUUID(ew)
+				ew.Close()
+				return
+			}
 		}
 	}
 
