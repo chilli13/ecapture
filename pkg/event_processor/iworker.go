@@ -19,6 +19,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,9 +38,11 @@ type IWorker interface {
 	// 收包
 	Write(event.IEventStruct) error
 	GetUUID() string
+	GetSock() uint64
 	IfUsed() bool
 	Get()
 	Put()
+	CloseEventWorker()
 }
 
 const (
@@ -52,7 +56,7 @@ type LifeCycleState uint8
 
 const (
 	LifeCycleStateDefault LifeCycleState = iota
-	LifeCycleStateSocket
+	LifeCycleStateSock
 )
 
 var (
@@ -69,6 +73,8 @@ type eventWorker struct {
 	ticker           *time.Ticker
 	tickerCount      uint8
 	UUID             string
+	uuidOutput       string
+	Sock             uint64
 	processor        *EventProcessor
 	parser           IParser
 	payload          *bytes.Buffer
@@ -87,6 +93,34 @@ func NewEventWorker(uuid string, processor *EventProcessor) IWorker {
 	return eWorker
 }
 
+func (ew *eventWorker) uuidParse(uuid string) {
+	ew.uuidOutput = uuid
+	ew.Sock = 0
+	ew.ewLifeCycleState = LifeCycleStateDefault
+	ew.closeChan = nil
+
+	//uuid: Pid_Tid_Comm_Fd_DataType_Tuple_Sock
+	uuidFileCount := 7
+	parts := strings.SplitN(uuid, "_", uuidFileCount)
+	if len(parts) != uuidFileCount {
+		return
+	}
+
+	sock, err := strconv.ParseUint(parts[uuidFileCount-1], 10, 64)
+	if err != nil || sock <= 0 {
+		return
+	}
+
+	uuidOutput := uuid[:strings.LastIndex(uuid, "_")]
+	ew.uuidOutput = uuidOutput
+	ew.Sock = sock
+	ew.ewLifeCycleState = LifeCycleStateSock
+	ew.closeChan = make(chan struct{})
+
+	log.Println("===zhm uuidParse sock:", ew.Sock)
+	return
+}
+
 func (ew *eventWorker) init(uuid string, processor *EventProcessor) {
 	ew.ticker = time.NewTicker(time.Millisecond * 100)
 	ew.incoming = make(chan event.IEventStruct, MaxChanLen)
@@ -96,28 +130,14 @@ func (ew *eventWorker) init(uuid string, processor *EventProcessor) {
 	ew.processor = processor
 	ew.payload = bytes.NewBuffer(nil)
 	ew.payload.Reset()
-	ew.ewLifeCycleState = ew.CheckLifeCycleState(uuid)
-	if ew.ewLifeCycleState != LifeCycleStateDefault {
-		ew.closeChan = make(chan struct{})
-	} else {
-		ew.closeChan = nil
-	}
+	ew.parser = nil
+	ew.uuidParse(uuid)
 }
 
 func (ew *eventWorker) GetUUID() string {
 	return ew.UUID
 }
 
-// 对UUID使用前缀判断，只有"sock"前缀的可以返回LifeCycleStateSocket生命周期
-func (ew *eventWorker) CheckLifeCycleState(uuid string) LifeCycleState {
-	if strings.HasPrefix(uuid, event.SocketLifecycleUUIDPrefix) {
-		return LifeCycleStateSocket
-	} else {
-		return LifeCycleStateDefault
-	}
-}
-
-// 导出方法，用于发送信号量
 func (ew *eventWorker) CloseEventWorker() {
 	if ew.closeChan != nil {
 		ew.closeOnce.Do(func() {
@@ -126,8 +146,8 @@ func (ew *eventWorker) CloseEventWorker() {
 	}
 }
 
-func (ew *eventWorker) GetLifeCycleState() LifeCycleState {
-	return ew.ewLifeCycleState
+func (ew *eventWorker) GetSock() uint64 {
+	return ew.Sock
 }
 
 func (ew *eventWorker) Write(e event.IEventStruct) error {
@@ -154,7 +174,13 @@ func (ew *eventWorker) writeToChan(s string) error {
 func (ew *eventWorker) Display() error {
 	//  输出包内容
 	b := ew.parserEvents()
-	defer ew.parser.Reset()
+	defer func() {
+		// 设定状态、重置包类型
+		ew.parser.Reset()
+		ew.payload.Reset()
+		ew.status = ProcessStateInit
+		ew.packetType = PacketTypeNull
+	}()
 	if len(b) <= 0 {
 		return nil
 	}
@@ -164,18 +190,19 @@ func (ew *eventWorker) Display() error {
 	}
 
 	//iWorker只负责写入，不应该打印。
-	e := ew.writeToChan(fmt.Sprintf("UUID:%s, Name:%s, Type:%d, Length:%d\n%s\n", ew.UUID, ew.parser.Name(), ew.parser.ParserType(), len(b), b))
-	//ew.parser.Reset()
-	// 设定状态、重置包类型
-	ew.status = ProcessStateInit
-	ew.packetType = PacketTypeNull
+	//zhm
+	//e := ew.writeToChan(fmt.Sprintf("UUID:%s, Name:%s, Type:%d, Length:%d\n%s\n", ew.uuidOutput, ew.parser.Name(), ew.parser.ParserType(), len(b), b))
+	e := ew.writeToChan(fmt.Sprintf("UUID:%s, Name:%s, Type:%d, Life:%d, Length:%d\n%s\n",
+		ew.UUID, ew.parser.Name(), ew.parser.ParserType(), ew.ewLifeCycleState, len(b), b))
+	ew.payload.Reset()
 	return e
 }
 
 func (ew *eventWorker) writeEvent(e event.IEventStruct) {
+	//zhm todo
 	if ew.status != ProcessStateInit {
-		_ = ew.writeToChan("write events failed, unknow eventWorker status")
-		return
+		_ = ew.writeToChan(fmt.Sprintf("==== zhm write events failed, unknow eventWorker status: %d", ew.status))
+		//return
 	}
 
 	tsize := int(ew.processor.truncateSize)
@@ -192,8 +219,12 @@ func (ew *eventWorker) writeEvent(e event.IEventStruct) {
 // 解析类型，输出
 func (ew *eventWorker) parserEvents() []byte {
 	ew.status = ProcessStateProcessing
-	parser := NewParser(ew.payload.Bytes())
-	ew.parser = parser
+	if ew.parser == nil {
+		ew.parser = NewParser(ew.payload.Bytes())
+		log.Println("===zhm NewParser :", ew.UUID)
+	} else {
+		log.Println("===zhm OldParser :", ew.UUID)
+	}
 	n, e := ew.parser.Write(ew.payload.Bytes())
 	if e != nil {
 		_ = ew.writeToChan(fmt.Sprintf("ew.parser write payload %d bytes, error:%s", n, e.Error()))
@@ -203,27 +234,31 @@ func (ew *eventWorker) parserEvents() []byte {
 }
 
 func (ew *eventWorker) Run() {
+	tickerRestartFlag := false
 	for {
 		select {
 		case <-ew.ticker.C:
 			// 输出包
 			if ew.tickerCount > MaxTickerCount {
-				// 生命周期和外部sock绑定，在这里无视定时器规则
-				if ew.ewLifeCycleState == LifeCycleStateSocket {
+				if ew.ewLifeCycleState == LifeCycleStateSock {
+					ew.drainAndClose()
 					ew.tickerCount = 0
+					tickerRestartFlag = true
 					continue
+				} else {
+					ew.processor.delWorkerByUUID(ew)
+					ew.drainAndClose()
+					return
 				}
-				ew.processor.delWorkerByUUID(ew)
-				ew.drainAndClose()
-				return
 			}
 			ew.tickerCount++
 		case e := <-ew.incoming:
-			// reset tickerCount
+			if tickerRestartFlag {
+				ew.ticker = time.NewTicker(time.Millisecond * 100)
+				tickerRestartFlag = false
+			}
 			ew.tickerCount = 0
 			ew.writeEvent(e)
-
-		// LifeCycleStateDefault情况下是nil，永远不会触发
 		case <-ew.closeChan:
 			ew.processor.delWorkerByUUID(ew)
 			ew.drainAndClose()
@@ -281,10 +316,8 @@ func (ew *eventWorker) Put() {
 	if !ew.used.CompareAndSwap(true, false) {
 		panic("unexpected behavior and incorrect usage for eventWorker")
 	}
-
 }
 
 func (ew *eventWorker) IfUsed() bool {
-
 	return ew.used.Load()
 }
